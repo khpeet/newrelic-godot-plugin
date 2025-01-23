@@ -1,0 +1,13 @@
+[gd_scene load_steps=2 format=3 uid="uid://ktls38478412"]
+
+[ext_resource type="Script" path="res://test.gd" id="1_ejikv"]
+
+[node name="Node" type="Node"]
+script = ExtResource("1_ejikv")
+
+[node name="send_btn" type="Button" parent="."]
+offset_right = 256.0
+offset_bottom = 116.0
+text = "Send Data"
+
+[connection signal="pressed" from="send_btn" to="." method="_on_button_pressed"]
