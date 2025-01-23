@@ -108,6 +108,8 @@ await newrelic.handle_exit()
 ## Using Data in New Relic
 [Dashboards](https://docs.newrelic.com/docs/query-your-data/explore-query-data/dashboards/introduction-dashboards/) can be built to easily visualize the data stored within New Relic. They are built with a SQL-like language called [NRQL](https://docs.newrelic.com/docs/nrql/get-started/introduction-nrql-new-relics-query-language/)
 
+![Dashboard](screenshots/dashboard-example.png)
+
 ## Additional Notes
 * The default max queue size (100) for http requests can be configured here depending on your performance needs.
 * Compression is used to reduce the size of request bodies.
