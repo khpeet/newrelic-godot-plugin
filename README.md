@@ -114,6 +114,10 @@ await newrelic.handle_exit()
 * The default max queue size (100) for http requests can be configured here depending on your performance needs.
 * Compression is used to reduce the size of request bodies.
 * It is expected to not send any sensitive or identifying player information. This plugin provides no safeguards for that.
+* Attribute keys `"message"` and `"timestamp"` are reserved in `send_log` — passing them in the `attributes` dictionary will emit a warning and skip those keys to preserve required New Relic fields.
+
+## Roadmap / Known Limitations
+* **Request batching:** Each API call currently sends one HTTP request. New Relic's Event, Metric, and Log APIs all support arrays/batching. A future enhancement could accumulate calls over a frame window and flush them in one compressed request, substantially reducing HTTP overhead for high-frequency telemetry.
 
 ## License
 New Relic Godot Plugin is licensed under the [Apache 2.0](http://apache.org/licenses/LICENSE-2.0.txt) License.

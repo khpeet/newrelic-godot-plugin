@@ -5,280 +5,232 @@ extends Node
 ## Compression is used to speed up requests
 
 ## Max size of queue - data will be dropped if limit is exceeded, and queue will be reset.
-## increase/decrease as needed for performance
+## Increase/decrease as needed for performance
 const MAX_Q_SIZE = 100
 
-var ingest_key = ProjectSettings.get_setting("newrelic/general/ingest_key", null)
-var account_id = ProjectSettings.get_setting("newrelic/general/account_id", null)
-var region = ProjectSettings.get_setting("newrelic/general/region", "US")
+const RESERVED_LOG_KEYS: Array[String] = ["message", "timestamp"]
 
-var can_send_data: bool = false
+var _ingest_key: String
+var _account_id: String
+var _region: String
 
-var http_request: HTTPRequest
-var request_in_progress: bool = false
-var should_drain_q = false
-var request_q: Array[Dictionary] = []
-var current_q_size = 0
+var _can_send_data: bool = false
+
+var _http_request: HTTPRequest
+var _request_in_progress: bool = false
+var _should_drain_q: bool = false
+var _request_q: Array[Dictionary] = []
+
+var _event_endpoint: String
+var _metric_endpoint: String
+var _log_endpoint: String
+var _headers: PackedStringArray
 
 signal exit_handled
 
 
-## Called when the node enters the scene tree for the first time.
 func _ready() -> void:
-	if ingest_key && account_id:
-		can_send_data = true
-		http_request = HTTPRequest.new()
-		add_child(http_request)
-		http_request.request_completed.connect(_on_request_complete)
+	_ingest_key = ProjectSettings.get_setting("newrelic/general/ingest_key", "")
+	_account_id = ProjectSettings.get_setting("newrelic/general/account_id", "")
+	_region     = ProjectSettings.get_setting("newrelic/general/region", "US")
+
+	if _ingest_key and _account_id:
+		_can_send_data = true
+		_http_request = HTTPRequest.new()
+		_http_request.use_threads = true
+		add_child(_http_request)
+		_http_request.request_completed.connect(_on_request_complete)
+
+		var eu := _region == "EU"
+		_event_endpoint  = "https://insights-collector%s.newrelic.com/v1/accounts/%s/events" \
+				% [(".eu01" if eu else ""), _account_id]
+		_metric_endpoint = "https://metric-api%s.newrelic.com/metric/v1" \
+				% [(".eu" if eu else "")]
+		_log_endpoint    = "https://log-api%s.newrelic.com/log/v1" \
+				% [(".eu" if eu else "")]
+		_headers = PackedStringArray([
+			"Content-Type: application/json",
+			"Content-Encoding: gzip",
+			"Api-Key: " + _ingest_key,
+		])
 
 
 ## Used to send events to New Relic's event API
 # @param: key - Key of event - Accepts string only [Required]
 # @param: value - Value of event - Accepts string, int, or bool types [Required]
 # @param: table - Table to post key-value pair to - Accepts string only [Required]
-# @param: includeDeviceInfo - Send device metadata associated with metric - Default: false
-func send_event(key: String, value, table: String, includeDeviceInfo: bool = false) -> void:
-	if not can_send_data:
+# @param: includeDeviceInfo - Send device metadata associated with event - Default: false
+func send_event(key: String, value: Variant, table: String, includeDeviceInfo: bool = false) -> void:
+	if not _can_send_data:
 		push_error("[NEWRELIC] Event collection skipped - validate configuration under Project Settings -> New Relic")
 		return
-	
+
 	if key.length() > 255:
 		push_error("[NEWRELIC] Event collection skipped - Key longer than 255 characters")
 		return
-	
+
 	if typeof(value) == TYPE_STRING:
-		if value.length() > 4096:
+		if (value as String).length() > 4096:
 			push_error("[NEWRELIC] Event collection skipped - Value longer than 4096 characters")
 			return
-	
-	current_q_size += 1
-	if current_q_size > MAX_Q_SIZE:
+
+	if _request_q.size() >= MAX_Q_SIZE:
 		push_error("[NEWRELIC] Request queue size exceeded - data temporarily dropped - resetting queue")
 		_reset_queue()
 		return
 
-	var EVENT_ENDPOINT = "https://insights-collector.newrelic.com/v1/accounts/{0}/events".format([account_id])
-	if region == "EU":
-		EVENT_ENDPOINT = "https://insights-collector.eu01.newrelic.com/v1/accounts/{0}/events".format([account_id])
-
-	var event_payload = [{
+	var event_payload: Array[Dictionary] = [{
 		"eventType": table
 	}]
-	var headers = [
-		"Content-Type: application/json",
-		"Content-Encoding: gzip",
-		"Api-Key: " + ingest_key
-	]
-		
 	event_payload[0][key] = value
 	if includeDeviceInfo:
-		event_payload[0]["os_type"] = OS.get_name()
-		event_payload[0]["os_version"] = OS.get_version()
-		event_payload[0]["isDebugBuild"] = OS.is_debug_build()
-		event_payload[0]["cpu"] = OS.get_processor_name()
-		var graphics_info = OS.get_video_adapter_driver_info()
-		if graphics_info.size() > 0:
-			event_payload[0]["gpu_type"] = graphics_info[0]
-			event_payload[0]["gpu_version"] = graphics_info[1]
-	
-	var compressed_payload = _compress_payload(JSON.stringify(event_payload))
-	
-	var request = {
-		"url": EVENT_ENDPOINT,
-		"headers": headers,
-		"body": compressed_payload
-	}
-	request_q.append(request)
-	_handle_requests()
+		_add_device_info(event_payload[0])
+
+	_enqueue(_event_endpoint, JSON.stringify(event_payload))
 
 
 ## Used to send metrics to New Relic's metric API
-# @param: name - Name of metric [Required] - Default: null
-# @param: value - Value of metric [Required] - number|map - Default: null
+# @param: name - Name of metric [Required]
+# @param: value - Value of metric [Required] - number|map
 # @param: type - Type of metric - count|gauge|summary - Default: gauge
 # @param: interval - Length of metric time window in milliseconds [Required for count/summary only] - Default: 0
 # @param: attributes - Map of key-value pairs associated with metric - Default: {}
 # @param: includeDeviceInfo - Send device metadata associated with metric - Default: false
-func send_metric(name: String, value, type: String = "gauge", interval: int = 0, attributes: Dictionary = {}, includeDeviceInfo: bool = false) -> void:
-	if not can_send_data:
+func send_metric(name: String, value: Variant, type: String = "gauge", interval: int = 0, attributes: Dictionary = {}, includeDeviceInfo: bool = false) -> void:
+	if not _can_send_data:
 		push_error("[NEWRELIC] Metric collection skipped - validate configuration under Project Settings -> New Relic")
 		return
-	
-	var metric_payload = [{
-		"metrics": [
-			{
-				"name": name,
-				"type": type,
-				"value": value,
-				"timestamp": Time.get_unix_time_from_system()
-			}
-		]
-	}]
+
 	if type in ["count", "summary"]:
-		if interval > 0:
-			metric_payload[0]["metrics"][0]["interval.ms"] = interval
-		else:
+		if interval <= 0:
 			push_error("[NEWRELIC] interval in milliseconds required for count or summary metrics - skipping metric")
 			return
-	
-	if attributes.size() > 0:
-		metric_payload[0]["metrics"][0]["attributes"] = attributes
-	
-	if includeDeviceInfo:
-		metric_payload[0]["common"] = {}
-		metric_payload[0]["common"]["attributes"] = {
-			"os_type": OS.get_name(),
-			"os_version": OS.get_version(),
-			"isDebugBuild": OS.is_debug_build(),
-			"cpu": OS.get_processor_name()
-		}
-		var graphics_info = OS.get_video_adapter_driver_info()
-		if graphics_info.size() > 0:
-			metric_payload[0]["common"]["attributes"]["gpu_type"] = graphics_info[0]
-			metric_payload[0]["common"]["attributes"]["gpu_version"] = graphics_info[1]
-	
-	current_q_size += 1
-	if current_q_size > MAX_Q_SIZE:
+
+	if _request_q.size() >= MAX_Q_SIZE:
 		push_error("[NEWRELIC] Request queue size exceeded - data temporarily dropped - resetting queue")
 		_reset_queue()
 		return
-	
-	var METRIC_ENDPOINT = "https://metric-api.newrelic.com/metric/v1"
-	if region == "EU":
-		METRIC_ENDPOINT = "https://metric-api.eu.newrelic.com/metric/v1"
 
-	var headers = [
-		"Content-Type: application/json",
-		"Content-Encoding: gzip",
-		"Api-Key: " + ingest_key
-	]
-	
-	var compressed_payload = _compress_payload(JSON.stringify(metric_payload))
-	var request = {
-		"url": METRIC_ENDPOINT,
-		"headers": headers,
-		"body": compressed_payload
+	var metric: Dictionary = {
+		"name": name,
+		"type": type,
+		"value": value,
+		"timestamp": Time.get_unix_time_from_system()
 	}
-	
-	request_q.append(request)
-	_handle_requests()
+	if type in ["count", "summary"]:
+		metric["interval.ms"] = interval
+	if attributes.size() > 0:
+		metric["attributes"] = attributes
+
+	var metric_payload: Array[Dictionary] = [{"metrics": [metric]}]
+
+	if includeDeviceInfo:
+		var common_attrs: Dictionary = {}
+		_add_device_info(common_attrs)
+		metric_payload[0]["common"] = {"attributes": common_attrs}
+
+	_enqueue(_metric_endpoint, JSON.stringify(metric_payload))
 
 
 ## Used to send logs to New Relic's log API
-# @param: message - Log message to send [Required] - Default: ""
+# @param: message - Log message to send [Required]
 # @param: attributes - Map of key-value pairs associated with log - Default: {}
-# @param: includeDeviceInfo - Send device metadata associated with metric - Default: false
+# @param: includeDeviceInfo - Send device metadata associated with log - Default: false
 func send_log(message: String, attributes: Dictionary = {}, includeDeviceInfo: bool = false) -> void:
-	if not can_send_data:
+	if not _can_send_data:
 		push_error("[NEWRELIC] Log collection skipped - validate configuration under Project Settings -> New Relic")
 		return
-	
-	var log_payload = {
-		"message": message,
-		"timestamp": Time.get_unix_time_from_system()
-	}
-	
-	if attributes.size() > 0:
-		for key in attributes.keys():
-			log_payload[key] = attributes[key]
-	
-	if includeDeviceInfo:
-		log_payload["os_type"] = OS.get_name()
-		log_payload["os_version"] = OS.get_version()
-		log_payload["isDebugBuild"] = OS.is_debug_build()
-		log_payload["cpu"] = OS.get_processor_name()
-		var graphics_info = OS.get_video_adapter_driver_info()
-		if graphics_info.size() > 0:
-			log_payload["gpu_type"] = graphics_info[0]
-			log_payload["gpu_version"] = graphics_info[1]
 
-	current_q_size += 1
-	if current_q_size > MAX_Q_SIZE:
+	if _request_q.size() >= MAX_Q_SIZE:
 		push_error("[NEWRELIC] Request queue size exceeded - data temporarily dropped - resetting queue")
 		_reset_queue()
 		return
-	
-	var LOG_ENDPOINT = "https://log-api.newrelic.com/log/v1"
-	if region == "EU":
-		LOG_ENDPOINT = "https://log-api.eu.newrelic.com/log/v1"
 
-	var headers = [
-		"Content-Type: application/json",
-		"Content-Encoding: gzip",
-		"Api-Key: " + ingest_key
-	]
-	
-	var compressed_payload = _compress_payload(JSON.stringify(log_payload))
-	var request = {
-		"url": LOG_ENDPOINT,
-		"headers": headers,
-		"body": compressed_payload
+	var log_payload: Dictionary = {
+		"message": message,
+		"timestamp": Time.get_unix_time_from_system()
 	}
-	
-	request_q.append(request)
+
+	for key in attributes:
+		if key in RESERVED_LOG_KEYS:
+			push_warning("[NEWRELIC] send_log attribute key '%s' is reserved and will be skipped" % key)
+			continue
+		log_payload[key] = attributes[key]
+
+	if includeDeviceInfo:
+		_add_device_info(log_payload)
+
+	_enqueue(_log_endpoint, JSON.stringify(log_payload))
+
+
+## Must be awaited before SceneTree.quit() to ensure any queued requests are sent
+func handle_exit() -> void:
+	_should_drain_q = true
+	_handle_requests()
+	await exit_handled
+
+
+## Compress any request body
+func _compress_payload(payload: String) -> PackedByteArray:
+	return payload.to_utf8_buffer().compress(FileAccess.COMPRESSION_GZIP)
+
+
+func _enqueue(url: String, body: String) -> void:
+	_request_q.append({
+		"url": url,
+		"headers": _headers,
+		"body": _compress_payload(body)
+	})
 	_handle_requests()
 
 
-## Should be called to send final events to New Relic before any game close events
-func handle_exit():
-	should_drain_q = true
-	_handle_requests()
-	return exit_handled
+func _reset_queue() -> void:
+	_request_q.clear()
+
+
+func _add_device_info(target: Dictionary) -> void:
+	target["os_type"]      = OS.get_name()
+	target["os_version"]   = OS.get_version()
+	target["isDebugBuild"] = OS.is_debug_build()
+	target["cpu"]          = OS.get_processor_name()
+	var graphics_info: PackedStringArray = OS.get_video_adapter_driver_info()
+	if graphics_info.size() > 0:
+		target["gpu_type"]    = graphics_info[0]
+		target["gpu_version"] = graphics_info[1]
 
 
 ## Main request queue handler
 func _handle_requests() -> void:
-	if not request_q.is_empty() and not request_in_progress:
-		request_in_progress = true
-		var req: Dictionary = request_q.front()
-		var result = http_request.request_raw(
+	if not _request_q.is_empty() and not _request_in_progress:
+		_request_in_progress = true
+		var req: Dictionary = _request_q.front()
+		var err: int = _http_request.request_raw(
 			req["url"],
 			req["headers"],
 			HTTPClient.METHOD_POST,
 			req["body"]
 		)
-		if result != OK:
-			_handle_request_failure(result)
+		if err != OK:
+			push_error("[NEWRELIC] Failed to send HTTP request. Error: %d" % err)
+			_request_in_progress = false
+			_request_q.pop_front()
+			_handle_requests()
+			return
 
-	# emit exit signal if q drained successfully
-	if should_drain_q and request_q.is_empty():
+	if _should_drain_q and _request_q.is_empty():
+		_should_drain_q = false
 		await get_tree().process_frame
 		exit_handled.emit()
 
 
-## Compress any request body
-func _compress_payload(payload: String) -> PackedByteArray:
-	return PackedByteArray(payload.to_utf8_buffer()).compress(FileAccess.COMPRESSION_GZIP)
-
-
-func _reset_queue() -> void:
-	request_q.clear()
-	current_q_size = 0
-
-
-## Handles any HTTP failures
-func _handle_request_failure(response_code: int) -> void:
-	if not request_q.is_empty():
-		request_q.pop_front()
-		current_q_size = max(current_q_size - 1, 0)
-	
-	if response_code >= 400:
-		push_error("[NEWRELIC] http request failed. result: %d" % response_code)
-	
-	request_in_progress = false
-	_handle_requests()
-
-
 ## Handles New Relic response
-func _on_request_complete(result, response_code, headers, body) -> void:
-	if response_code >= 200 and response_code <= 299:
-		if not request_q.is_empty():
-			request_q.pop_front()
-			current_q_size = max(current_q_size - 1, 0)
-		if should_drain_q:
-			_handle_requests()
-	else:
-		_handle_request_failure(response_code)
-	
-	request_in_progress = false
+func _on_request_complete(result: int, response_code: int, headers: PackedStringArray, body: PackedByteArray) -> void:
+	_request_in_progress = false
+
+	if not _request_q.is_empty():
+		_request_q.pop_front()
+
+	if response_code < 200 or response_code > 299:
+		push_error("[NEWRELIC] HTTP request failed. Response code: %d" % response_code)
+
 	_handle_requests()
