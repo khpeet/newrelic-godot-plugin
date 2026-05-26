@@ -13,3 +13,12 @@ export_presets.cfg
 .mono/
 data_*/
 mono_crash.*.json
+
+# Import/Temp files
+*.import
+*.temp
+*.uid
+
+# AI
+CLAUDE.md
+.claude/ 

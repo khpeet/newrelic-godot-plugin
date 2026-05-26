@@ -10,25 +10,26 @@ const PLUGIN_PROPERTIES := [
 ]
 
 
-func _enter_tree() -> void:	
-	#Init configuration
+func _enter_tree() -> void:
 	for prop in PLUGIN_PROPERTIES:
 		if not ProjectSettings.has_setting(prop["name"]):
 			ProjectSettings.set_setting(prop["name"], prop["default"])
-			ProjectSettings.add_property_info({
-				"name": prop["name"],
-				"type": prop["type"],
-				"hint": prop["hint"],
-				"hint_string": prop["hint_string"]
-			})
-			ProjectSettings.set_as_basic(prop["name"], true)
-	
-	if ProjectSettings.get_setting("newrelic/general/ingest_key") == "" or not ProjectSettings.get_setting("newrelic/general/ingest_key"):
+		ProjectSettings.add_property_info({
+			"name": prop["name"],
+			"type": prop["type"],
+			"hint": prop["hint"],
+			"hint_string": prop["hint_string"]
+		})
+		ProjectSettings.set_as_basic(prop["name"], true)
+
+	var ingest_key: String = ProjectSettings.get_setting("newrelic/general/ingest_key", "")
+	if not ingest_key:
 		printerr("Ingest key has not been set for New Relic.")
-	
-	if ProjectSettings.get_setting("newrelic/general/account_id") == "" or not ProjectSettings.get_setting("newrelic/general/account_id"):
+
+	var account_id: String = ProjectSettings.get_setting("newrelic/general/account_id", "")
+	if not account_id:
 		printerr("Account ID has not been set for New Relic.")
-		
+
 	add_autoload_singleton(AUTOLOAD_NAME, AUTOLOAD_PATH)
 
 
